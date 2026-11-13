@@ -124,6 +124,7 @@ input[type=text],input[type=number]{font:inherit;background:#0f1630;color:var(--
 <div id="toast" role="status"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/mqtt@5.16.1/dist/mqtt.min.js"></script>
+<script>window.mqtt||document.write('<script src="https://unpkg.com/mqtt@5.16.1/dist/mqtt.min.js"><\/script>')</script>
 <script>
 /*ENGINE-START*/
 // ---------- Data papan ----------
@@ -395,49 +396,78 @@ function act(S,i,a){
 /*ENGINE-END*/
 
 // ---------- Jaringan (MQTT, host memegang state) ----------
+// Tersambung ke beberapa broker publik sekaligus; cukup satu yang tembus di kedua sisi.
+// Broker port 443 didahulukan karena banyak jaringan kantor/sekolah memblokir port lain.
 const $=id=>document.getElementById(id);
 const AL='ABCDEFGHJKLMNPQRSTUVWXYZ';
 const qs=new URLSearchParams(location.search);
-const BROKERS=qs.get('broker')?[qs.get('broker')]:['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt'];
-let S=null,mq=null,base='',my=-1,mod=null,me={};
+const BROKERS=qs.get('broker')?qs.get('broker').split(',').map(u=>({u})):[
+  {u:'wss://mqtt.eclipseprojects.io:443/mqtt'},
+  {u:'wss://public.cloud.shiftr.io:443',o:{username:'public',password:'public'}},
+  {u:'wss://broker.emqx.io:8084/mqtt'},
+  {u:'wss://broker.hivemq.com:8884/mqtt'},
+  {u:'wss://test.mosquitto.org:8081'}];
+let S=null,cls=[],base='',my=-1,mod=null,me={},seq=0,heard=0,seen=new Set(),wd=0;
 const status=t=>$('status').textContent=t;
-const net=(on,msg)=>{const t=on?'':msg||'Koneksi terputus, menyambung ulang.';$('hconn').textContent=t;if(!on||$('status').textContent.startsWith('Koneksi'))status(t)};
+const live=()=>cls.some(c=>c.connected);
+function net(){
+  const t=!live()?'Koneksi terputus, menyambung ulang.':!me.host&&S&&Date.now()-heard>45000?'Host tidak merespons, menunggu host kembali.':'';
+  $('hconn').textContent=t;
+}
 function toast(t){const e=$('toast');e.textContent=t;e.classList.add('on');clearTimeout(e.tm);e.tm=setTimeout(()=>e.classList.remove('on'),3500)}
 function store(){try{const d=JSON.stringify({...me,S:me.host?S:0});sessionStorage.tt=d;localStorage.tt=d}catch(e){}}
-const hello=()=>mq.publish(base+'/act',JSON.stringify({pid:me.pid,a:{t:'hello',name:me.name}}));
+const mid=()=>Math.random().toString(36).slice(2,12);
+function pub(tp,o){const m=JSON.stringify(o);cls.forEach(c=>{if(c.connected)c.publish(base+tp,m)})}
+const once=m=>{if(!m||seen.has(m))return false;seen.add(m);if(seen.size>500)seen.delete(seen.values().next().value);return true};
 
-function connect(fail){
-  if(!window.mqtt)return status('Gagal memuat pustaka jaringan. Muat ulang halaman.');
-  if(mq)mq.end(true);
-  base='tuantanah1/'+me.code;
-  const host=me.host,url=BROKERS[AL.indexOf(me.code[0])%BROKERS.length];
-  const c=mq=mqtt.connect(url,{keepalive:20,reconnectPeriod:2000,connectTimeout:8000,
-    will:{topic:base+(host?'/st':'/act'),payload:host?'{"gone":1}':JSON.stringify({pid:me.pid,a:{t:'bye'}}),qos:0,retain:false}});
-  let ok=false;
-  const tm=setTimeout(()=>{if(!ok){c.end(true);fail()}},9000);
-  c.on('connect',()=>{
-    if(host){ok=true;clearTimeout(tm);c.subscribe(base+'/act',()=>cast())}
-    else c.subscribe([base+'/st',base+'/to/'+me.pid],()=>hello());
-    net(true);
+const hello=()=>pub('/act',{pid:me.pid,m:mid(),a:{t:'hello',name:me.name}});
+
+// ok(): dipanggil sekali saat berhasil; fail(pesan): dipanggil kalau gagal
+function connect(ok,fail){
+  if(!window.mqtt)return fail('Gagal memuat pustaka jaringan. Muat ulang halaman.');
+  cls.forEach(c=>c.end(true));clearInterval(wd);
+  base='tuantanah2/'+me.code;seq=0;heard=0;
+  const host=me.host;let done=false,any=false;
+  const fin=(good,msg)=>{if(done)return;done=true;clearTimeout(tm);if(good)ok();else{cls.forEach(c=>c.end(true));cls=[];fail(msg)}};
+  const tm=setTimeout(()=>fin(false,any?'Room tidak ditemukan, atau host sedang offline.':'Tidak bisa terhubung ke server. Cek internet lalu coba lagi.'),host?12000:15000);
+  cls=BROKERS.map(b=>{
+    let c;
+    try{c=mqtt.connect(b.u,{keepalive:30,reconnectPeriod:3000,connectTimeout:10000,clean:true,...b.o,
+      will:host?undefined:{topic:base+'/act',payload:JSON.stringify({pid:me.pid,m:mid(),a:{t:'bye'}}),qos:0,retain:false}})}
+    catch(e){return{connected:false,end(){}}}
+    c.on('error',()=>{});
+    c.on('connect',()=>{
+      any=true;
+      if(host){c.subscribe(base+'/act',()=>{c.publish(base+'/st',JSON.stringify(view()))});fin(true)}
+      else c.subscribe([base+'/st',base+'/to/'+me.pid],()=>hello());
+      net();
+    });
+    c.on('close',net);
+    c.on('message',(tp,m)=>{
+      let d;try{d=JSON.parse(m.toString())}catch(e){return}
+      if(!d||typeof d!=='object')return;
+      if(host)return onAct(d);
+      if(d.err){if(!once(d.m))return;if(!done)return fin(false,d.err);return toast(d.err)}
+      if(!d.players||!(d.seq>=seq))return;
+      heard=Date.now();
+      const p=d.players.find(p=>p.id===me.pid);
+      if(!p)return;
+      const fresh=d.seq>seq||!S;seq=d.seq;
+      if(fresh){S=d;store();render()}
+      net();fin(true);
+      if(!p.on)hello();
+    });
+    return c;
   });
-  c.on('close',()=>{if(ok)net(false)});
-  c.on('message',(tp,m)=>{
-    let d;try{d=JSON.parse(m.toString())}catch(e){return}
-    if(!d)return;
-    if(host)return onAct(d);
-    if(d.err){toast(d.err);if(!ok){clearTimeout(tm);c.end(true);status(d.err)}return}
-    if(d.gone)return net(false,'Host terputus, menunggu host kembali.');
-    const p=d.players&&d.players.find(p=>p.id===me.pid);
-    if(!p)return;
-    ok=true;clearTimeout(tm);S=d;net(true);store();render();
-    if(!p.on)hello();
-  });
+  // host kirim detak tiap 15 dtk; klien cek host masih hidup
+  wd=setInterval(()=>{if(host){if(done)pub('/st',view())}else{net();if(S&&Date.now()-heard>20000)hello()}},15000);
 }
+const view=()=>({...S,decks:0});
 // host: terima aksi dari pemain lain
 function onAct(d){
   const a=d.a,pid=d.pid;
-  if(!a||!/^\w{1,20}$/.test(pid))return;
-  const i=S.players.findIndex(p=>p.id===pid),to=o=>mq.publish(base+'/to/'+pid,JSON.stringify(o));
+  if(!a||typeof pid!=='string'||!/^\w{1,20}$/.test(pid)||!once(pid+d.m))return;
+  const i=S.players.findIndex(p=>p.id===pid),to=o=>pub('/to/'+pid,{...o,m:mid()});
   if(a.t==='hello'){
     if(i>=0)S.players[i].on=true;
     else if(S.phase!=='lobby')return to({err:'Permainan di room ini sudah berjalan.'});
@@ -447,36 +477,39 @@ function onAct(d){
   }
   if(i<0)return;
   if(a.t==='bye'){if(S.phase==='lobby')S.players.splice(i,1);else S.players[i].on=false;return cast()}
+  S.players[i].on=true;
   const e=act(S,i,a);if(e)to({err:e});
   cast();
 }
-function cast(){store();if(mq&&mq.connected)mq.publish(base+'/st',JSON.stringify({...S,decks:0}));render()}
+function cast(){S.seq=(S.seq||0)+1;store();pub('/st',view());render()}
 function go(a){
-  if(!me.host)return mq.publish(base+'/act',JSON.stringify({pid:me.pid,a}));
+  if(!me.host){if(!live())return toast('Koneksi terputus, tunggu sebentar.');return pub('/act',{pid:me.pid,m:mid(),a})}
   const e=act(S,S.players.findIndex(p=>p.id===me.pid),a);if(e)toast(e);
   cast();
 }
 
 // ---------- Lobi ----------
+let busy=false;
 function ident(){
   const n=$('name').value.trim();
   if(!n){status('Isi nama dulu.');return false}
   me={pid:Math.random().toString(36).slice(2,10),name:n.slice(0,12)};return true;
 }
-function doCreate(bi=0){
-  if(!bi&&!ident())return;
-  if(bi>=BROKERS.length)return status('Tidak bisa terhubung ke server. Cek internet lalu coba lagi.');
-  const n=BROKERS.length,r=k=>Math.floor(Math.random()*k);
-  me.code=AL[bi+n*r(AL.length/n|0)]+[0,0,0,0].map(()=>AL[r(AL.length)]).join('');me.host=true;
-  S={phase:'lobby',players:[{id:me.pid,name:me.name,on:true}]};
-  status('Menghubungkan.');connect(()=>doCreate(bi+1));
+function lock(t){busy=!!t;document.querySelectorAll('#entry button').forEach(b=>b.disabled=busy);if(t)status(t)}
+function doCreate(){
+  if(busy||!ident())return;
+  me.code=[0,0,0,0,0].map(()=>AL[Math.floor(Math.random()*AL.length)]).join('');me.host=true;
+  S={phase:'lobby',players:[{id:me.pid,name:me.name,on:true}],seq:1};
+  lock('Membuat room.');
+  connect(()=>{lock();cast()},m=>{lock();S=null;status(m)});
 }
 function doJoin(){
+  if(busy)return;
   const c=$('code').value.trim().toUpperCase();
   if(!/^[A-HJ-NP-Z]{5}$/.test(c))return status('Kode room terdiri dari 5 huruf.');
   if(!ident())return;
-  me.code=c;me.host=false;S=null;status('Mencari room.');
-  connect(()=>status('Room tidak ditemukan, atau host sedang offline.'));
+  me.code=c;me.host=false;S=null;lock('Mencari room.');
+  connect(()=>lock(),m=>{lock();S=null;status(m)});
 }
 function start(){newGame(S);cast()}
 function kickP(j){if(!confirm('Keluarkan '+S.players[j].name+'? Asetnya dikembalikan ke bank dan dilelang.'))return;kick(S,j);cast()}
@@ -490,8 +523,8 @@ $('code').value=(qs.get('r')||'').toUpperCase();
   if(!sv||!sv.code||(sv.host&&!sv.S))return;
   $('name').value=sv.name;
   const b=$('bResume');b.hidden=false;b.textContent=`Lanjutkan room ${sv.code} sebagai ${sv.name}`;
-  b.onclick=()=>{me={pid:sv.pid,name:sv.name,code:sv.code,host:sv.host};S=sv.host?sv.S:null;status('Menghubungkan.');
-    connect(()=>status(sv.host?'Tidak bisa terhubung ke server.':'Room tidak ditemukan, atau host sedang offline.'))};
+  b.onclick=()=>{if(busy)return;me={pid:sv.pid,name:sv.name,code:sv.code,host:sv.host};S=sv.host?sv.S:null;lock('Menghubungkan.');
+    connect(()=>{lock();if(me.host)cast()},m=>{lock();if(!me.host)S=null;status(m)})};
 })();
 
 // ---------- Tampilan ----------
